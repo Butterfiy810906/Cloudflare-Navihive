@@ -1,5 +1,6 @@
 // src/api/http.ts
 // 不使用外部JWT库，改为内置的crypto API
+import * as bcrypt from 'bcryptjs';
 
 // 定义D1数据库类型
 interface D1Database {
@@ -27,7 +28,7 @@ interface Env {
   DB: D1Database;
   AUTH_ENABLED?: string; // 是否启用身份验证
   AUTH_USERNAME?: string; // 认证用户名
-  AUTH_PASSWORD?: string; // 认证密码
+  AUTH_PASSWORD?: string; // 认证密码哈希 (bcrypt)
   AUTH_SECRET?: string; // JWT密钥
 }
 
@@ -107,14 +108,14 @@ export class NavigationAPI {
   private db: D1Database;
   private authEnabled: boolean;
   private username: string;
-  private password: string;
+  private passwordHash: string; // 存储bcrypt哈希而非明文密码
   private secret: string;
 
   constructor(env: Env) {
     this.db = env.DB;
     this.authEnabled = env.AUTH_ENABLED === 'true';
     this.username = env.AUTH_USERNAME || '';
-    this.password = env.AUTH_PASSWORD || '';
+    this.passwordHash = env.AUTH_PASSWORD || ''; // 现在存储的是哈希
     this.secret = env.AUTH_SECRET || 'DefaultSecretKey';
   }
 
@@ -166,8 +167,18 @@ export class NavigationAPI {
       };
     }
 
-    // 验证用户名和密码
-    if (loginRequest.username === this.username && loginRequest.password === this.password) {
+    // 验证用户名
+    if (loginRequest.username !== this.username) {
+      return {
+        success: false,
+        message: '用户名或密码错误',
+      };
+    }
+
+    // 使用 bcrypt 验证密码
+    const isPasswordValid = await bcrypt.compare(loginRequest.password, this.passwordHash);
+
+    if (isPasswordValid) {
       // 生成JWT令牌，传递记住我参数
       const token = await this.generateToken(
         { username: loginRequest.username },
@@ -194,23 +205,53 @@ export class NavigationAPI {
 
     try {
       // 解析JWT
-      const [header, payload, signature] = token.split('.');
-      if (!header || !payload || !signature) {
-        throw new Error('无效的Token格式');
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        return { valid: false };
       }
 
-      // 解码payload
-      const decodedPayload = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+      const [encodedHeader, encodedPayload, signature] = parts;
 
-      // 验证过期时间
-      if (decodedPayload.exp && decodedPayload.exp < Math.floor(Date.now() / 1000)) {
-        throw new Error('Token已过期');
+      // Validate all parts exist
+      if (!encodedHeader || !encodedPayload || !signature) {
+        return { valid: false };
       }
 
-      // 注意：这个简化版本没有验证签名，仅用于开发/测试
-      // 在生产环境中，应该使用crypto.subtle.verify来验证签名
+      // 重新生成签名进行验证
+      const encoder = new TextEncoder();
+      const data = encoder.encode(`${encodedHeader}.${encodedPayload}`);
+      const keyData = encoder.encode(this.secret);
 
-      return { valid: true, payload: decodedPayload };
+      // 导入密钥
+      const key = await crypto.subtle.importKey(
+        'raw',
+        keyData,
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['verify']
+      );
+
+      // 解码签名
+      const signatureBytes = this.base64UrlDecode(signature);
+
+      // 验证签名
+      const isValid = await crypto.subtle.verify('HMAC', key, signatureBytes, data);
+
+      if (!isValid) {
+        return { valid: false };
+      }
+
+      // 解码并验证 payload
+      const payloadStr = atob(encodedPayload.replace(/-/g, '+').replace(/_/g, '/'));
+      const payload = JSON.parse(payloadStr) as Record<string, unknown>;
+
+      // 检查过期时间
+      const now = Math.floor(Date.now() / 1000);
+      if (payload.exp && typeof payload.exp === 'number' && payload.exp < now) {
+        return { valid: false };
+      }
+
+      return { valid: true, payload };
     } catch (error) {
       console.error('Token验证失败:', error);
       return { valid: false };
@@ -235,24 +276,59 @@ export class NavigationAPI {
 
     // 创建Header和Payload部分
     const header = { alg: 'HS256', typ: 'JWT' };
-    const encodedHeader = btoa(JSON.stringify(header))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-    const encodedPayload = btoa(JSON.stringify(tokenPayload))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
+    const encodedHeader = this.base64UrlEncode(JSON.stringify(header));
+    const encodedPayload = this.base64UrlEncode(JSON.stringify(tokenPayload));
 
-    // 创建签名（简化版，仅用于开发/测试）
-    // 在生产环境中，应该使用crypto.subtle.sign生成签名
-    const signature = btoa(this.secret + encodedHeader + encodedPayload)
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
+    // 使用 Web Crypto API 进行 HMAC-SHA256 签名
+    const encoder = new TextEncoder();
+    const data = encoder.encode(`${encodedHeader}.${encodedPayload}`);
+    const keyData = encoder.encode(this.secret);
+
+    // 导入密钥
+    const key = await crypto.subtle.importKey(
+      'raw',
+      keyData,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    // 生成签名
+    const signatureBuffer = await crypto.subtle.sign('HMAC', key, data);
+    const signature = this.base64UrlEncode(signatureBuffer);
 
     // 组合JWT
     return `${encodedHeader}.${encodedPayload}.${signature}`;
+  }
+
+  // 辅助方法：base64url 编码（支持字符串和 ArrayBuffer）
+  private base64UrlEncode(data: string | ArrayBuffer): string {
+    let base64: string;
+
+    if (typeof data === 'string') {
+      base64 = btoa(data);
+    } else {
+      // ArrayBuffer 转 base64
+      const bytes = new Uint8Array(data);
+      const binary = Array.from(bytes)
+        .map((byte) => String.fromCharCode(byte))
+        .join('');
+      base64 = btoa(binary);
+    }
+
+    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // 辅助方法：base64url 解码为 ArrayBuffer
+  private base64UrlDecode(base64url: string): ArrayBuffer {
+    const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+    const binary = atob(base64 + padding);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
   }
 
   // 检查认证是否启用
@@ -286,23 +362,34 @@ export class NavigationAPI {
     if (!result.results || result.results.length === 0) {
       throw new Error('创建分组失败');
     }
-    return result.results[0];
+    const createdGroup = result.results[0];
+    if (!createdGroup) {
+      throw new Error('创建分组失败');
+    }
+    return createdGroup;
   }
 
   async updateGroup(id: number, group: Partial<Group>): Promise<Group | null> {
-    // 使用参数化查询，避免SQL注入
+    // 字段白名单
+    const ALLOWED_FIELDS = ['name', 'order_num'] as const;
+    type AllowedField = (typeof ALLOWED_FIELDS)[number];
+
     const updates: string[] = ['updated_at = CURRENT_TIMESTAMP'];
     const params: (string | number)[] = [];
 
-    // 安全地添加字段
-    if (group.name !== undefined) {
-      updates.push('name = ?');
-      params.push(group.name);
-    }
+    // 只允许更新白名单中的字段
+    Object.entries(group).forEach(([key, value]) => {
+      if (ALLOWED_FIELDS.includes(key as AllowedField) && value !== undefined) {
+        updates.push(`${key} = ?`);
+        params.push(value);
+      } else if (key !== 'id' && key !== 'created_at' && key !== 'updated_at') {
+        console.warn(`尝试更新不允许的字段: ${key}`);
+      }
+    });
 
-    if (group.order_num !== undefined) {
-      updates.push('order_num = ?');
-      params.push(group.order_num);
+    if (updates.length === 1) {
+      // 只有 updated_at，没有实际更新
+      throw new Error('没有可更新的字段');
     }
 
     // 构建安全的参数化查询
@@ -311,15 +398,13 @@ export class NavigationAPI {
     )} WHERE id = ? RETURNING id, name, order_num, created_at, updated_at`;
     params.push(id);
 
-    const result = await this.db
-      .prepare(query)
-      .bind(...params)
-      .all<Group>();
+    const result = await this.db.prepare(query).bind(...params).all<Group>();
 
     if (!result.results || result.results.length === 0) {
       return null;
     }
-    return result.results[0];
+    const updatedGroup = result.results[0];
+    return updatedGroup || null;
   }
 
   async deleteGroup(id: number): Promise<boolean> {
@@ -380,48 +465,42 @@ export class NavigationAPI {
     if (!result.results || result.results.length === 0) {
       throw new Error('创建站点失败');
     }
-    return result.results[0];
+    const createdSite = result.results[0];
+    if (!createdSite) {
+      throw new Error('创建站点失败');
+    }
+    return createdSite;
   }
 
   async updateSite(id: number, site: Partial<Site>): Promise<Site | null> {
-    // 使用参数化查询，避免SQL注入
+    // 字段白名单
+    const ALLOWED_FIELDS = [
+      'group_id',
+      'name',
+      'url',
+      'icon',
+      'description',
+      'notes',
+      'order_num',
+    ] as const;
+    type AllowedField = (typeof ALLOWED_FIELDS)[number];
+
     const updates: string[] = ['updated_at = CURRENT_TIMESTAMP'];
     const params: (string | number)[] = [];
 
-    // 安全地添加字段
-    if (site.group_id !== undefined) {
-      updates.push('group_id = ?');
-      params.push(site.group_id);
-    }
+    // 只允许更新白名单中的字段
+    Object.entries(site).forEach(([key, value]) => {
+      if (ALLOWED_FIELDS.includes(key as AllowedField) && value !== undefined) {
+        updates.push(`${key} = ?`);
+        params.push(value);
+      } else if (key !== 'id' && key !== 'created_at' && key !== 'updated_at') {
+        console.warn(`尝试更新不允许的字段: ${key}`);
+      }
+    });
 
-    if (site.name !== undefined) {
-      updates.push('name = ?');
-      params.push(site.name);
-    }
-
-    if (site.url !== undefined) {
-      updates.push('url = ?');
-      params.push(site.url);
-    }
-
-    if (site.icon !== undefined) {
-      updates.push('icon = ?');
-      params.push(site.icon);
-    }
-
-    if (site.description !== undefined) {
-      updates.push('description = ?');
-      params.push(site.description);
-    }
-
-    if (site.notes !== undefined) {
-      updates.push('notes = ?');
-      params.push(site.notes);
-    }
-
-    if (site.order_num !== undefined) {
-      updates.push('order_num = ?');
-      params.push(site.order_num);
+    if (updates.length === 1) {
+      // 只有 updated_at，没有实际更新
+      throw new Error('没有可更新的字段');
     }
 
     // 构建安全的参数化查询
@@ -430,15 +509,13 @@ export class NavigationAPI {
     )} WHERE id = ? RETURNING id, group_id, name, url, icon, description, notes, order_num, created_at, updated_at`;
     params.push(id);
 
-    const result = await this.db
-      .prepare(query)
-      .bind(...params)
-      .all<Site>();
+    const result = await this.db.prepare(query).bind(...params).all<Site>();
 
     if (!result.results || result.results.length === 0) {
       return null;
     }
-    return result.results[0];
+    const updatedSite = result.results[0];
+    return updatedSite || null;
   }
 
   async deleteSite(id: number): Promise<boolean> {
