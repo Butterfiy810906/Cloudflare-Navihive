@@ -1,6 +1,6 @@
 // src/api/http.ts
 // 不使用外部JWT库，改为内置的crypto API
-import * as bcrypt from 'bcryptjs';
+import { compareSync } from 'bcrypt-edge';
 
 // 定义D1数据库类型
 interface D1Database {
@@ -37,6 +37,7 @@ export interface Group {
   id?: number;
   name: string;
   order_num: number;
+  is_public?: number; // 0 = 私密（仅管理员可见），1 = 公开（访客可见）
   created_at?: string;
   updated_at?: string;
 }
@@ -50,8 +51,15 @@ export interface Site {
   description: string;
   notes: string;
   order_num: number;
+  is_public?: number; // 0 = 私密（仅管理员可见），1 = 公开（访客可见）
   created_at?: string;
   updated_at?: string;
+}
+
+// 分组及其站点 (用于优化 N+1 查询)
+export interface GroupWithSites extends Group {
+  id: number; // 确保 id 存在
+  sites: Site[];
 }
 
 // 新增配置接口
@@ -176,7 +184,7 @@ export class NavigationAPI {
     }
 
     // 使用 bcrypt 验证密码
-    const isPasswordValid = await bcrypt.compare(loginRequest.password, this.passwordHash);
+    const isPasswordValid = compareSync(loginRequest.password, this.passwordHash);
 
     if (isPasswordValid) {
       // 生成JWT令牌，传递记住我参数
@@ -355,9 +363,9 @@ export class NavigationAPI {
   async createGroup(group: Group): Promise<Group> {
     const result = await this.db
       .prepare(
-        'INSERT INTO groups (name, order_num) VALUES (?, ?) RETURNING id, name, order_num, created_at, updated_at'
+        'INSERT INTO groups (name, order_num, is_public) VALUES (?, ?, ?) RETURNING id, name, order_num, is_public, created_at, updated_at'
       )
-      .bind(group.name, group.order_num)
+      .bind(group.name, group.order_num, group.is_public ?? 1)
       .all<Group>();
     if (!result.results || result.results.length === 0) {
       throw new Error('创建分组失败');
@@ -371,7 +379,7 @@ export class NavigationAPI {
 
   async updateGroup(id: number, group: Partial<Group>): Promise<Group | null> {
     // 字段白名单
-    const ALLOWED_FIELDS = ['name', 'order_num'] as const;
+    const ALLOWED_FIELDS = ['name', 'order_num', 'is_public'] as const;
     type AllowedField = (typeof ALLOWED_FIELDS)[number];
 
     const updates: string[] = ['updated_at = CURRENT_TIMESTAMP'];
@@ -398,7 +406,10 @@ export class NavigationAPI {
     )} WHERE id = ? RETURNING id, name, order_num, created_at, updated_at`;
     params.push(id);
 
-    const result = await this.db.prepare(query).bind(...params).all<Group>();
+    const result = await this.db
+      .prepare(query)
+      .bind(...params)
+      .all<Group>();
 
     if (!result.results || result.results.length === 0) {
       return null;
@@ -432,6 +443,93 @@ export class NavigationAPI {
     return result.results || [];
   }
 
+  /**
+   * 获取所有分组及其站点 (使用 JOIN 优化,避免 N+1 查询)
+   * 返回格式: GroupWithSites[] (每个分组包含其站点数组)
+   */
+  async getGroupsWithSites(): Promise<GroupWithSites[]> {
+    // 使用 LEFT JOIN 一次性获取所有数据
+    const query = `
+      SELECT
+        g.id as group_id,
+        g.name as group_name,
+        g.order_num as group_order,
+        g.is_public as group_is_public,
+        g.created_at as group_created_at,
+        g.updated_at as group_updated_at,
+        s.id as site_id,
+        s.name as site_name,
+        s.url as site_url,
+        s.icon as site_icon,
+        s.description as site_description,
+        s.notes as site_notes,
+        s.order_num as site_order,
+        s.is_public as site_is_public,
+        s.created_at as site_created_at,
+        s.updated_at as site_updated_at
+      FROM groups g
+      LEFT JOIN sites s ON g.id = s.group_id
+      ORDER BY g.order_num ASC, s.order_num ASC
+    `;
+
+    const result = await this.db.prepare(query).all<{
+      group_id: number;
+      group_name: string;
+      group_order: number;
+      group_is_public?: number;
+      group_created_at: string;
+      group_updated_at: string;
+      site_id: number | null;
+      site_name: string | null;
+      site_url: string | null;
+      site_icon: string | null;
+      site_description: string | null;
+      site_notes: string | null;
+      site_order: number | null;
+      site_is_public?: number;
+      site_created_at: string | null;
+      site_updated_at: string | null;
+    }>();
+
+    // 将查询结果转换为 GroupWithSites 格式
+    const groupsMap = new Map<number, GroupWithSites>();
+
+    for (const row of result.results || []) {
+      // 如果分组不存在,创建它
+      if (!groupsMap.has(row.group_id)) {
+        groupsMap.set(row.group_id, {
+          id: row.group_id,
+          name: row.group_name,
+          order_num: row.group_order,
+          is_public: row.group_is_public,
+          created_at: row.group_created_at,
+          updated_at: row.group_updated_at,
+          sites: [],
+        });
+      }
+
+      // 如果有站点数据,添加到分组的 sites 数组
+      if (row.site_id !== null) {
+        const group = groupsMap.get(row.group_id)!;
+        group.sites.push({
+          id: row.site_id,
+          group_id: row.group_id,
+          name: row.site_name!,
+          url: row.site_url!,
+          icon: row.site_icon || '',
+          description: row.site_description || '',
+          notes: row.site_notes || '',
+          order_num: row.site_order!,
+          is_public: row.site_is_public,
+          created_at: row.site_created_at!,
+          updated_at: row.site_updated_at!,
+        });
+      }
+    }
+
+    return Array.from(groupsMap.values());
+  }
+
   async getSite(id: number): Promise<Site | null> {
     const result = await this.db
       .prepare(
@@ -446,9 +544,9 @@ export class NavigationAPI {
     const result = await this.db
       .prepare(
         `
-      INSERT INTO sites (group_id, name, url, icon, description, notes, order_num) 
-      VALUES (?, ?, ?, ?, ?, ?, ?) 
-      RETURNING id, group_id, name, url, icon, description, notes, order_num, created_at, updated_at
+      INSERT INTO sites (group_id, name, url, icon, description, notes, order_num, is_public)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id, group_id, name, url, icon, description, notes, order_num, is_public, created_at, updated_at
     `
       )
       .bind(
@@ -458,7 +556,8 @@ export class NavigationAPI {
         site.icon || '',
         site.description || '',
         site.notes || '',
-        site.order_num
+        site.order_num,
+        site.is_public ?? 1
       )
       .all<Site>();
 
@@ -482,6 +581,7 @@ export class NavigationAPI {
       'description',
       'notes',
       'order_num',
+      'is_public',
     ] as const;
     type AllowedField = (typeof ALLOWED_FIELDS)[number];
 
@@ -509,7 +609,10 @@ export class NavigationAPI {
     )} WHERE id = ? RETURNING id, group_id, name, url, icon, description, notes, order_num, created_at, updated_at`;
     params.push(id);
 
-    const result = await this.db.prepare(query).bind(...params).all<Site>();
+    const result = await this.db
+      .prepare(query)
+      .bind(...params)
+      .all<Site>();
 
     if (!result.results || result.results.length === 0) {
       return null;
